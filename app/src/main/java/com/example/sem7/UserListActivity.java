@@ -9,6 +9,7 @@ import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ArrayAdapter;
+import android.widget.Button;
 import android.widget.Filter;
 import android.widget.ListView;
 import android.widget.SearchView;
@@ -22,6 +23,7 @@ import com.google.firebase.database.DataSnapshot;
 import com.google.firebase.database.DatabaseError;
 import com.google.firebase.database.DatabaseReference;
 import com.google.firebase.database.FirebaseDatabase;
+import com.google.firebase.database.Query;
 import com.google.firebase.database.ValueEventListener;
 
 import java.util.ArrayList;
@@ -32,12 +34,22 @@ public class UserListActivity extends AppCompatActivity {
     private static final String TAG = "UserListActivity";
     private ListView listViewUsers;
     private SearchView searchView;
+    private Button btnPrevious;
+    private Button btnNext;
+    private TextView tvPageInfo;
 
     private FirebaseAuth mAuth;
     private DatabaseReference mDatabase;
     private List<Usuario> userList;
     private List<Usuario> userListFull;
     private ArrayAdapter<Usuario> adapter;
+
+    // Parámetros de paginación
+    private static final int USERS_PER_PAGE = 10;
+    private int currentPage = 1;
+    private boolean isLastPage = false;
+    private String lastVisibleKey = null;
+    private List<String> pageKeys = new ArrayList<>();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -61,12 +73,17 @@ public class UserListActivity extends AppCompatActivity {
             }
         }
 
+        // Inicializar vistas
         listViewUsers = findViewById(R.id.listViewUsers);
         searchView = findViewById(R.id.searchView);
+        btnPrevious = findViewById(R.id.btnPrevious);
+        btnNext = findViewById(R.id.btnNext);
+        tvPageInfo = findViewById(R.id.tvPageInfo);
 
         // Inicializar listas
         userList = new ArrayList<>();
         userListFull = new ArrayList<>();
+        pageKeys.add(null); // Página 1 comienza sin key
 
         // Configurar el adaptador
         setupAdapter();
@@ -92,14 +109,67 @@ public class UserListActivity extends AppCompatActivity {
 
             @Override
             public boolean onQueryTextChange(String newText) {
-                adapter.getFilter().filter(newText);
+                if (newText == null || newText.isEmpty()) {
+                    // Si la búsqueda se vacía, volvemos a la carga paginada normal
+                    resetPagination();
+                    loadUsers();
+                } else {
+                    // Realizar búsqueda en toda la base de datos
+                    performSearch(newText);
+                }
                 return false;
             }
         });
+
+        // Configurar botones de paginación
+        btnPrevious.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (currentPage > 1) {
+                    currentPage--;
+                    lastVisibleKey = pageKeys.get(currentPage - 1);
+                    loadUsers();
+                    updatePageInfo();
+                }
+            }
+        });
+
+        btnNext.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (!isLastPage) {
+                    currentPage++;
+                    // Si ya tenemos la key para esta página, úsala
+                    if (pageKeys.size() >= currentPage) {
+                        lastVisibleKey = pageKeys.get(currentPage - 1);
+                    }
+                    loadUsers();
+                    updatePageInfo();
+                }
+            }
+        });
+
+        // Inicializar información de página
+        updatePageInfo();
+    }
+
+    private void resetPagination() {
+        currentPage = 1;
+        isLastPage = false;
+        lastVisibleKey = null;
+        pageKeys.clear();
+        pageKeys.add(null); // Página 1 comienza sin key
+        updatePageInfo();
+    }
+
+    private void updatePageInfo() {
+        tvPageInfo.setText("Página " + currentPage);
+        btnPrevious.setEnabled(currentPage > 1);
+        btnNext.setEnabled(!isLastPage);
     }
 
     private void setupAdapter() {
-        // Código del adaptador (sin cambios)
+        // Código del adaptador
         adapter = new ArrayAdapter<Usuario>(this, R.layout.item_user, R.id.tvNombre, userList) {
             @Override
             public View getView(int position, View convertView, ViewGroup parent) {
@@ -173,40 +243,82 @@ public class UserListActivity extends AppCompatActivity {
     }
 
     private void loadUsers() {
-        Log.d(TAG, "Iniciando carga de usuarios...");
+        Log.d(TAG, "Cargando usuarios para página " + currentPage);
         try {
-            mDatabase.addValueEventListener(new ValueEventListener() {
+            // Limpiar la lista actual
+            userList.clear();
+            adapter.notifyDataSetChanged();
+
+            // Crear la consulta paginada
+            Query query;
+            if (lastVisibleKey == null) {
+                // Primera página
+                query = mDatabase.orderByKey().limitToFirst(USERS_PER_PAGE + 1);
+            } else {
+                // Páginas subsiguientes
+                query = mDatabase.orderByKey().startAt(lastVisibleKey).limitToFirst(USERS_PER_PAGE + 1);
+            }
+
+            query.addListenerForSingleValueEvent(new ValueEventListener() {
                 @Override
                 public void onDataChange(@NonNull DataSnapshot dataSnapshot) {
                     userList.clear();
                     userListFull.clear();
-                    Log.d(TAG, "Número de usuarios: " + dataSnapshot.getChildrenCount());
+
+                    Log.d(TAG, "Recibidos: " + dataSnapshot.getChildrenCount() + " usuarios");
+
+                    // Procesar los resultados
+                    List<Usuario> pageUsers = new ArrayList<>();
+                    String newLastKey = null;
+                    int count = 0;
 
                     for (DataSnapshot snapshot : dataSnapshot.getChildren()) {
-                        try {
-                            Log.d(TAG, "Procesando usuario key: " + snapshot.getKey());
-                            Log.d(TAG, "Contenido del snapshot: " + snapshot.getValue().toString());
+                        count++;
+                        // Si es el último elemento y tenemos más de USERS_PER_PAGE, no lo agregamos a la página actual
+                        if (count > USERS_PER_PAGE) {
+                            newLastKey = snapshot.getKey();
+                            continue;
+                        }
 
+                        try {
                             Usuario user = snapshot.getValue(Usuario.class);
                             if (user != null) {
-                                userList.add(user);
-                                userListFull.add(user);
-                                Log.d(TAG, "Usuario cargado: " + user.getNombre());
-                            } else {
-                                Log.e(TAG, "Usuario es null después de convertir el snapshot");
+                                pageUsers.add(user);
+                                if (count == USERS_PER_PAGE) {
+                                    // Guardamos la key del último usuario visible para la siguiente página
+                                    newLastKey = snapshot.getKey();
+                                }
                             }
                         } catch (Exception e) {
-                            Log.e(TAG, "Error al procesar el usuario", e);
+                            Log.e(TAG, "Error al procesar usuario", e);
                         }
                     }
 
+                    // Actualizar la lista y el estado de paginación
+                    userList.addAll(pageUsers);
+                    userListFull.addAll(pageUsers);
                     adapter.notifyDataSetChanged();
 
-                    if(userList.isEmpty()) {
-                        Log.e(TAG, "La lista de usuarios está vacía después de cargar datos");
-                        Toast.makeText(UserListActivity.this, "No se encontraron usuarios", Toast.LENGTH_SHORT).show();
+                    // Determinar si es la última página
+                    isLastPage = (dataSnapshot.getChildrenCount() <= USERS_PER_PAGE);
+
+                    // Actualizar las keys de página
+                    if (newLastKey != null) {
+                        if (pageKeys.size() <= currentPage) {
+                            pageKeys.add(newLastKey);
+                        } else {
+                            pageKeys.set(currentPage, newLastKey);
+                        }
+                        lastVisibleKey = newLastKey;
+                    }
+
+                    // Actualizar UI de paginación
+                    updatePageInfo();
+
+                    if (userList.isEmpty()) {
+                        Toast.makeText(UserListActivity.this, "No hay más usuarios", Toast.LENGTH_SHORT).show();
                     } else {
-                        Log.d(TAG, "Total de usuarios cargados: " + userList.size());
+                        Log.d(TAG, "Cargados " + userList.size() + " usuarios en página " + currentPage);
                     }
                 }
 
@@ -217,8 +329,55 @@ public class UserListActivity extends AppCompatActivity {
                 }
             });
         } catch (Exception e) {
-            Log.e(TAG, "Error al agregar valueEventListener", e);
-            Toast.makeText(this, "Error al configurar la escucha de datos", Toast.LENGTH_LONG).show();
+            Log.e(TAG, "Error al realizar consulta paginada", e);
+            Toast.makeText(this, "Error al cargar datos", Toast.LENGTH_SHORT).show();
         }
+    }
+
+    private void performSearch(String query) {
+        Log.d(TAG, "Realizando búsqueda: " + query);
+
+        // Para búsquedas, cargamos todos los datos sin paginación
+        mDatabase.addListenerForSingleValueEvent(new ValueEventListener() {
+            @Override
+            public void onDataChange(@NonNull DataSnapshot dataSnapshot) {
+                List<Usuario> searchResults = new ArrayList<>();
+
+                for (DataSnapshot snapshot : dataSnapshot.getChildren()) {
+                    try {
+                        Usuario user = snapshot.getValue(Usuario.class);
+                        if (user != null &&
+                                ((user.getNombre() != null && user.getNombre().toLowerCase().contains(query.toLowerCase())) ||
+                                        (user.getEmail() != null && user.getEmail().toLowerCase().contains(query.toLowerCase())))) {
+                            searchResults.add(user);
+                        }
+                    } catch (Exception e) {
+                        Log.e(TAG, "Error al procesar usuario en búsqueda", e);
+                    }
+                }
+
+                // Actualizar la interfaz con los resultados
+                userList.clear();
+                userList.addAll(searchResults);
+                userListFull.clear();
+                userListFull.addAll(searchResults);
+                adapter.notifyDataSetChanged();
+
+                // Ocultar controles de paginación durante la búsqueda
+                btnPrevious.setVisibility(View.GONE);
+                btnNext.setVisibility(View.GONE);
+                tvPageInfo.setText("Resultados de búsqueda: " + searchResults.size());
+
+                if (searchResults.isEmpty()) {
+                    Toast.makeText(UserListActivity.this, "No se encontraron resultados", Toast.LENGTH_SHORT).show();
+                }
+            }
+
+            @Override
+            public void onCancelled(@NonNull DatabaseError databaseError) {
+                Log.e(TAG, "Error al realizar búsqueda: " + databaseError.getMessage());
+                Toast.makeText(UserListActivity.this, "Error al realizar búsqueda", Toast.LENGTH_SHORT).show();
+            }
+        });
     }
 }
